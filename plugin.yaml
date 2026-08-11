@@ -1,0 +1,4 @@
+name: agent-lifecycle-terminal-title
+version: 1.0.0
+description: Prefix the active terminal title with Hermes CLI lifecycle status while mirroring session titles.
+author: Ofek
