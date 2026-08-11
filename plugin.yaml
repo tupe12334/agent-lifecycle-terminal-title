@@ -1,4 +1,4 @@
 name: agent-lifecycle-terminal-title
-version: 1.0.0
-description: Prefix the active terminal title with Hermes CLI lifecycle status while mirroring session titles.
+version: 1.1.0
+description: Mirror Hermes lifecycle and session titles to terminal tabs and tmux windows.
 author: Ofek
