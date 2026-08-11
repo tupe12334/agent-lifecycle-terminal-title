@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import threading
 from typing import Any, Callable
@@ -9,6 +11,7 @@ from typing import Any, Callable
 _ORIGINAL_SETTER_ATTR = "_agent_lifecycle_terminal_title_original_setter"
 _ORIGINAL_CLI_COMMAND_ATTR = "_agent_lifecycle_terminal_title_original_process_command"
 _ORIGINAL_CHAT_ATTR = "_agent_lifecycle_terminal_title_original_chat"
+_ORIGINAL_CLI_RUN_ATTR = "_agent_lifecycle_terminal_title_original_run"
 
 _WORKING = "⌛️"
 _SUCCESS = "✅"
@@ -32,27 +35,64 @@ def _render_title() -> str:
         return f"{_lifecycle_marker} {_base_title}"
 
 
-def _write_terminal_title() -> None:
-    """Write an OSC 0 title sequence to the controlling terminal, if any."""
-    sequence = f"\x1b]0;{_safe_terminal_title(_render_title())}\x07"
+def _run_tmux(*args: str) -> None:
+    """Run a cosmetic tmux command without affecting a foreground turn."""
+    try:
+        subprocess.run(
+            ["tmux", *args],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+
+
+def _rename_tmux_window(title: str) -> None:
+    """Mirror a title to its tmux window and its outer terminal tab.
+
+    tmux owns the outer title and defaults ``set-titles`` to off; that leaves a
+    terminal displaying its session summary (for example, ``1222: 1 windows``)
+    despite a successful window rename. Scope configuration and naming to the
+    originating ``TMUX_PANE`` so a concurrent tmux client cannot be redirected.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not os.environ.get("TMUX") or not pane:
+        return
+    _run_tmux("set-option", "-t", pane, "set-titles", "on")
+    _run_tmux("set-option", "-t", pane, "set-titles-string", "#W")
+    _run_tmux("rename-window", "-t", pane, title)
+
+
+def _write_terminal_title(title: Any | None = None) -> None:
+    """Write a safe title to the terminal, tmux window, and outer tab."""
+    safe_title = _safe_terminal_title(_render_title() if title is None else title)
+    sequence = f"\x1b]0;{safe_title}\x07\x1b]2;{safe_title}\x07"
+    wrote_to_terminal = False
     try:
         # prompt-toolkit may proxy stdout; /dev/tty is the launch terminal.
         with open("/dev/tty", "w", encoding="utf-8", errors="ignore") as tty:
-            if not tty.isatty():
-                return
-            tty.write(sequence)
-            tty.flush()
-        return
+            if tty.isatty():
+                tty.write(sequence)
+                tty.flush()
+                wrote_to_terminal = True
     except OSError:
         pass
-    try:
-        if not sys.stdout.isatty():
+
+    if not wrote_to_terminal:
+        try:
+            if not sys.stdout.isatty():
+                return
+            sys.stdout.write(sequence)
+            sys.stdout.flush()
+            wrote_to_terminal = True
+        except Exception:
+            # Terminal decoration is cosmetic and must never affect an agent turn.
             return
-        sys.stdout.write(sequence)
-        sys.stdout.flush()
-    except Exception:
-        # Terminal decoration is cosmetic and must never affect an agent turn.
-        return
+
+    if wrote_to_terminal:
+        _rename_tmux_window(safe_title)
 
 
 def _set_base_title(title: Any) -> None:
@@ -156,9 +196,34 @@ def _install_cli_lifecycle_writer() -> None:
     HermesCLI.chat = wrapped
 
 
+def _install_cli_close_title_writer() -> None:
+    """Leave a finished interactive terminal as a direct resume target."""
+    try:
+        from cli import HermesCLI
+    except Exception:
+        return
+    if getattr(HermesCLI, _ORIGINAL_CLI_RUN_ATTR, None) is not None:
+        return
+    original: Callable[..., Any] = HermesCLI.run
+
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            session_id = getattr(self, "session_id", None)
+            agent = getattr(self, "agent", None)
+            session_id = getattr(agent, "session_id", None) or session_id
+            if session_id:
+                _write_terminal_title(session_id)
+
+    setattr(HermesCLI, _ORIGINAL_CLI_RUN_ATTR, original)
+    HermesCLI.run = wrapped
+
+
 def register(ctx: Any) -> None:
     """Install idempotent title and foreground-CLI lifecycle integrations."""
     del ctx
     _install_title_writer()
     _install_pending_cli_title_writer()
     _install_cli_lifecycle_writer()
+    _install_cli_close_title_writer()
