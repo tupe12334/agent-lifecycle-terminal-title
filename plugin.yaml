@@ -1,4 +1,4 @@
 name: agent-lifecycle-terminal-title
-version: 1.1.0
+version: 1.2.0
 description: Mirror Hermes lifecycle and session titles to terminal tabs and tmux windows.
 author: Ofek
