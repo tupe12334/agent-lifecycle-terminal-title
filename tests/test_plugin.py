@@ -35,12 +35,24 @@ class FakeSessionDB:
         self.calls = []
 
 
+class FakeGoalManager:
+    def __init__(self):
+        self.state = types.SimpleNamespace(
+            status="active", last_verdict=None, last_reason=None
+        )
+
+    def is_active(self):
+        return self.state.status == "active"
+
+
 class FakeCLI:
-    def __init__(self, result="done", title="Existing title"):
+    def __init__(self, result="done", title="Existing title", goal_reason=None):
         self.result = result
         self.session_id = "session-1"
         self._pending_title = None
         self._session_db = types.SimpleNamespace(get_session_title=lambda _: title)
+        self._goal = FakeGoalManager() if goal_reason is not None else None
+        self._goal_reason = goal_reason
 
     def process_command(self, command):
         if command.startswith("/title "):
@@ -48,7 +60,14 @@ class FakeCLI:
         return True
 
     def chat(self, *_args, **_kwargs):
+        if self._goal is not None:
+            self._goal.state.status = "done"
+            self._goal.state.last_verdict = "done"
+            self._goal.state.last_reason = self._goal_reason
         return self.result
+
+    def _get_goal_manager(self):
+        return self._goal
 
     def run(self, *_args, **_kwargs):
         return self.result
@@ -79,6 +98,17 @@ class LifecycleTitleTests(unittest.TestCase):
             output = captured.getvalue()
             self.assertIn(sequence("⌛️ Resume"), output)
             self.assertTrue(output.endswith(sequence("✅ Resume")))
+
+            captured.seek(0); captured.truncate(0)
+            self.assertEqual(
+                FakeCLI(
+                    "blocked",
+                    "Blocked goal",
+                    "Goal is blocked pending user input",
+                ).chat("hello"),
+                "blocked",
+            )
+            self.assertTrue(captured.getvalue().endswith(sequence("🚫 Blocked goal")))
 
             captured.seek(0); captured.truncate(0)
             self.assertTrue(FakeCLI("Error: failed", "Broken").chat("hello").startswith("Error:"))

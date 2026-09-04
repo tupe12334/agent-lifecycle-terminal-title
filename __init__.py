@@ -16,6 +16,7 @@ _ORIGINAL_CLI_RUN_ATTR = "_agent_lifecycle_terminal_title_original_run"
 _WORKING = "⌛️"
 _SUCCESS = "✅"
 _FAILURE = "❗️"
+_UNACHIEVABLE = "🚫"
 _DEFAULT_TITLE = "Hermes"
 
 _title_lock = threading.RLock()
@@ -109,6 +110,47 @@ def _set_lifecycle(marker: str) -> None:
     _write_terminal_title()
 
 
+def _goal_is_active(cli: Any) -> bool:
+    """Return whether this CLI turn begins with an active standing goal."""
+    try:
+        manager = cli._get_goal_manager()
+        return bool(manager and manager.is_active())
+    except Exception:
+        return False
+
+
+def _goal_was_judged_unachievable(cli: Any) -> bool:
+    """Identify a goal judge's terminal blocked/unachievable DONE verdict.
+
+    Hermes represents a blocked goal as the normal ``done`` verdict so the
+    Ralph loop stops spending turns. The reason is the only distinction exposed
+    at the CLI boundary, so use its documented blocked vocabulary rather than
+    treating every achieved goal as unavailable.
+    """
+    try:
+        state = cli._get_goal_manager().state
+        if (
+            state is None
+            or getattr(state, "status", None) != "done"
+            or getattr(state, "last_verdict", None) != "done"
+        ):
+            return False
+        reason = str(getattr(state, "last_reason", "") or "").casefold()
+    except Exception:
+        return False
+    return any(
+        phrase in reason
+        for phrase in (
+            "unachievable",
+            "blocked",
+            "need user input",
+            "needs user input",
+            "requires user input",
+            "awaiting user input",
+        )
+    )
+
+
 def _restore_persisted_title(cli: Any) -> None:
     """Use the resumed session title before setting a lifecycle state."""
     try:
@@ -175,6 +217,7 @@ def _install_cli_lifecycle_writer() -> None:
     original: Callable[..., Any] = HermesCLI.chat
 
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        goal_was_active = _goal_is_active(self)
         _restore_persisted_title(self)
         _set_lifecycle(_WORKING)
         try:
@@ -188,6 +231,8 @@ def _install_cli_lifecycle_writer() -> None:
             isinstance(response, str) and response.lstrip().startswith("Error:")
         ):
             _set_lifecycle(_FAILURE)
+        elif goal_was_active and _goal_was_judged_unachievable(self):
+            _set_lifecycle(_UNACHIEVABLE)
         else:
             _set_lifecycle(_SUCCESS)
         return response
