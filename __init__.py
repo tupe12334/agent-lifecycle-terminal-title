@@ -14,6 +14,7 @@ _ORIGINAL_CHAT_ATTR = "_agent_lifecycle_terminal_title_original_chat"
 _ORIGINAL_CLI_RUN_ATTR = "_agent_lifecycle_terminal_title_original_run"
 
 _WORKING = "⌛️"
+_GOAL_WORKING = "🎯"
 _SUCCESS = "✅"
 _FAILURE = "❗️"
 _UNACHIEVABLE = "🚫"
@@ -219,7 +220,7 @@ def _install_cli_lifecycle_writer() -> None:
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         goal_was_active = _goal_is_active(self)
         _restore_persisted_title(self)
-        _set_lifecycle(_WORKING)
+        _set_lifecycle(_GOAL_WORKING if goal_was_active else _WORKING)
         try:
             response = original(self, *args, **kwargs)
         except BaseException:

@@ -108,6 +108,7 @@ class LifecycleTitleTests(unittest.TestCase):
                 ).chat("hello"),
                 "blocked",
             )
+            self.assertIn(sequence("🎯 Blocked goal"), captured.getvalue())
             self.assertTrue(captured.getvalue().endswith(sequence("🚫 Blocked goal")))
 
             captured.seek(0); captured.truncate(0)

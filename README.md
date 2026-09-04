@@ -5,6 +5,7 @@ A native [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin tha
 ## Lifecycle markers
 
 - `⌛️` — the local Hermes CLI is processing a user turn
+- `🎯` — the local Hermes CLI is working on an active Goal
 - `✅` — the most recent turn completed successfully
 - `❗️` — the most recent turn failed
 - `🚫` — an active Goal was judged unachievable, blocked, or in need of user input
