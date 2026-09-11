@@ -14,9 +14,9 @@ The plugin mirrors manual `/title` changes, including a title queued before the 
 
 ## Discord thread lifecycle emojis
 
-This plugin is the single source of truth for Discord lifecycle emojis. When Hermes starts a Discord thread turn it sets `⏳`; after a `delegate_task` step with a live child owned by that session it sets `👥`; when the turn ends it sets `❌` on failure, otherwise `👥` while an owned child remains live and `✅` when none does. It changes only the lifecycle emoji via `adapter.rename_thread(thread_id, "", lifecycle_emoji=...)`.
+This plugin is the single source of truth for Discord lifecycle emojis. When Hermes starts a Discord thread turn it sets `⏳`; after a `delegate_task` step with a live child owned by that session it sets `👥`; when the turn ends it sets `❌` on failure, otherwise `👥` while an owned child remains live and `✅` when none does. It subscribes to Hermes's public `hermes:gateway_agent_lifecycle` stream and changes only the lifecycle emoji through the capability-gated `ctx.platform_actions.set_thread_lifecycle_emoji(...)` action.
 
-The integration wraps Hermes's internal gateway hook-registration boundary because the public out-of-tree plugin API does not yet expose gateway lifecycle events with Discord adapter/thread handles. It is idempotent, preserves existing hook registrations, and is cosmetic/fail-open. Current Hermes `agent:step` payloads do not include the adapter or thread ID, so `👥` is applied on the step only when those fields are supplied; the end-state transition still follows the owned-child check. Do not install a separate config-owned Discord lifecycle hook with this plugin enabled.
+Grant the plugin `gateway.platform_actions` before enabling its Discord behavior. The core event payload carries the source profile so a multiplexed gateway updates through the same bot identity that received the turn. Delivery is queued and cosmetic/fail-open. For compatibility with older Hermes versions that do not expose the public lifecycle stream, the plugin retains its private hook wrapper as a fallback only. Do not install a separate config-owned Discord lifecycle hook with this plugin enabled.
 
 ## tmux
 

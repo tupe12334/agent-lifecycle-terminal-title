@@ -407,5 +407,60 @@ class DiscordLifecycleHandlerTests(unittest.TestCase):
         run_async(self.plugin._handle_discord_lifecycle("agent:start", context))  # must not raise
 
 
+class FakePlatformActions:
+    def __init__(self):
+        self.calls = []
+
+    async def set_thread_lifecycle_emoji(self, platform, chat_id, thread_id, emoji, *, profile=None):
+        self.calls.append((platform, chat_id, thread_id, emoji, profile))
+        return {"ok": True}
+
+
+class PublicDiscordLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = load_plugin("lifecycle_public_discord_test")
+        self.original_modules = {
+            name: sys.modules.get(name) for name in ("hermes_cli", "hermes_cli.plugins")
+        }
+
+    def tearDown(self):
+        for name, module in self.original_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_public_event_routes_emoji_with_source_profile(self):
+        actions = FakePlatformActions()
+        run_async(self.plugin._handle_core_discord_lifecycle(
+            actions,
+            event_type="agent:end",
+            platform="discord",
+            chat_id="chat-1",
+            thread_id="thread-1",
+            session_id="session-1",
+            profile="team-b",
+            failed=True,
+        ))
+        self.assertEqual(actions.calls, [("discord", "chat-1", "thread-1", "❌", "team-b")])
+
+    def test_register_prefers_public_core_stream_over_private_hook_wrapper(self):
+        hermes_cli = types.ModuleType("hermes_cli")
+        plugins_module = types.ModuleType("hermes_cli.plugins")
+        plugins_module.emit_core_event = lambda *_args, **_kwargs: 0
+        hermes_cli.plugins = plugins_module
+        sys.modules["hermes_cli"] = hermes_cli
+        sys.modules["hermes_cli.plugins"] = plugins_module
+        subscriptions = []
+        ctx = types.SimpleNamespace(
+            platform_actions=FakePlatformActions(),
+            subscribe=lambda event, callback: subscriptions.append((event, callback)),
+        )
+
+        self.plugin.register(ctx)
+
+        self.assertEqual([event for event, _callback in subscriptions], ["hermes:gateway_agent_lifecycle"])
+
+
 if __name__ == "__main__":
     unittest.main()

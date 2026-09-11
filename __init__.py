@@ -337,6 +337,60 @@ async def _handle_discord_lifecycle(event_type: str, context: Any) -> None:
         return
 
 
+async def _handle_core_discord_lifecycle(actions: Any, **event: Any) -> None:
+    """Apply lifecycle state through Hermes's public event and platform-action contracts."""
+    try:
+        if event.get("platform") != DISCORD_PLATFORM:
+            return
+        thread_id = str(event.get("thread_id") or "").strip()
+        chat_id = str(event.get("chat_id") or "").strip()
+        if not thread_id or not chat_id:
+            return
+        event_type = str(event.get("event_type") or "")
+        session_id = event.get("session_id")
+        if event_type == "agent:start":
+            emoji = _DISCORD_EMOJI_START
+        elif event_type == "agent:step":
+            tool_names = event.get("tool_names") or ()
+            emoji = (
+                _DISCORD_EMOJI_DELEGATING
+                if DELEGATE_TASK_TOOL_NAME in tool_names and _has_active_owned_child(session_id)
+                else None
+            )
+        elif event.get("failed"):
+            emoji = _DISCORD_EMOJI_FAILED
+        else:
+            emoji = (
+                _DISCORD_EMOJI_DELEGATING
+                if _has_active_owned_child(session_id)
+                else _DISCORD_EMOJI_DONE
+            )
+        if emoji:
+            profile = str(event.get("profile") or "").strip() or None
+            await actions.set_thread_lifecycle_emoji(
+                DISCORD_PLATFORM, chat_id, thread_id, emoji, profile=profile,
+            )
+    except Exception:
+        # Cosmetic failures must never interrupt a gateway turn or event worker.
+        return
+
+
+def _register_core_discord_lifecycle(ctx: Any) -> bool:
+    """Subscribe to the public core lifecycle stream when the installed Hermes supports it."""
+    try:
+        from hermes_cli.plugins import emit_core_event
+    except Exception:
+        return False
+    if not callable(emit_core_event):
+        return False
+
+    async def handle(**event: Any) -> None:
+        await _handle_core_discord_lifecycle(ctx.platform_actions, **event)
+
+    ctx.subscribe("hermes:gateway_agent_lifecycle", handle)
+    return True
+
+
 _DISCORD_LIFECYCLE_HANDLERS = {
     event: _handle_discord_lifecycle for event in DISCORD_LIFECYCLE_EVENTS
 }
@@ -390,9 +444,12 @@ def _install_discord_lifecycle_hooks() -> None:
 
 def register(ctx: Any) -> None:
     """Install idempotent title and foreground-CLI lifecycle integrations."""
-    del ctx
     _install_title_writer()
     _install_pending_cli_title_writer()
     _install_cli_lifecycle_writer()
     _install_cli_close_title_writer()
-    _install_discord_lifecycle_hooks()
+    # New Hermes versions publish an adapter-free lifecycle event and expose a
+    # capability-gated emoji action. Retain the old private hook wrapper only
+    # as a compatibility fallback for older Hermes installations.
+    if not _register_core_discord_lifecycle(ctx):
+        _install_discord_lifecycle_hooks()
