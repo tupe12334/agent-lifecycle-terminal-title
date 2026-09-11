@@ -162,5 +162,250 @@ class TmuxTitleTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class FakeAdapter:
+    def __init__(self, rename_thread=None):
+        self.calls = []
+        if rename_thread is not None:
+            self.rename_thread = rename_thread
+
+    async def rename_thread(self, thread_id, name, *, lifecycle_emoji):
+        self.calls.append((thread_id, name, lifecycle_emoji))
+
+
+class FakeAgentContext:
+    def __init__(
+        self,
+        platform="discord",
+        thread_id="thread-1",
+        adapter=None,
+        session_id="session-1",
+        tool_names=(),
+        failed=False,
+    ):
+        self.platform = platform
+        self.thread_id = thread_id
+        self.adapter = FakeAdapter() if adapter is None else adapter
+        self.session_id = session_id
+        self.tool_names = tool_names
+        self.failed = failed
+
+
+class FakeHookRegistry:
+    _builtin_hook_calls = 0
+
+    def __init__(self):
+        self._handlers = {}
+
+    def _register_builtin_hooks(self):
+        type(self)._builtin_hook_calls += 1
+        self._handlers.setdefault("agent:start", []).append("builtin-start")
+
+
+def run_async(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+class DiscordLifecycleHookInstallationTests(unittest.TestCase):
+    def setUp(self):
+        self.original_modules = {
+            name: sys.modules.get(name) for name in ("gateway", "gateway.hooks")
+        }
+        gateway_pkg = types.ModuleType("gateway")
+        hooks_module = types.ModuleType("gateway.hooks")
+        hooks_module.HookRegistry = FakeHookRegistry
+        gateway_pkg.hooks = hooks_module
+        sys.modules["gateway"] = gateway_pkg
+        sys.modules["gateway.hooks"] = hooks_module
+        FakeHookRegistry._builtin_hook_calls = 0
+
+    def tearDown(self):
+        for name, module in self.original_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_wraps_register_builtin_hooks_idempotently(self):
+        plugin = load_plugin("lifecycle_discord_install_test")
+        plugin.register(object())
+        plugin.register(object())  # second registration must stay a no-op
+
+        registry = sys.modules["gateway.hooks"].HookRegistry()
+        registry._register_builtin_hooks()
+        registry._register_builtin_hooks()  # calling twice must not duplicate
+
+        self.assertEqual(sys.modules["gateway.hooks"].HookRegistry._builtin_hook_calls, 2)
+        self.assertEqual(registry._handlers["agent:start"].count("builtin-start"), 2)
+        for event in plugin.DISCORD_LIFECYCLE_EVENTS:
+            handlers = registry._handlers[event]
+            self.assertEqual(
+                handlers.count(plugin._DISCORD_LIFECYCLE_HANDLERS[event]), 1
+            )
+
+    def test_missing_gateway_package_is_a_harmless_noop(self):
+        sys.modules.pop("gateway", None)
+        sys.modules.pop("gateway.hooks", None)
+        plugin = load_plugin("lifecycle_discord_no_gateway_test")
+        plugin.register(object())  # must not raise
+
+
+class DiscordLifecycleHandlerTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = load_plugin("lifecycle_discord_handler_test")
+        self.original_modules = {
+            "tools.delegate_tool_registry": sys.modules.get(
+                "tools.delegate_tool_registry"
+            )
+        }
+
+    def tearDown(self):
+        for name, module in self.original_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def _install_subagent_registry(self, subagents=(), raises=False):
+        module = types.ModuleType("tools.delegate_tool_registry")
+
+        def list_active_subagents():
+            if raises:
+                raise RuntimeError("registry unavailable")
+            return subagents
+
+        module.list_active_subagents = list_active_subagents
+        sys.modules["tools.delegate_tool_registry"] = module
+
+    def test_start_renames_thread_with_hourglass(self):
+        self._install_subagent_registry()
+        adapter = FakeAdapter()
+        context = {
+            "platform": "discord",
+            "thread_id": "thread-1",
+            "adapter": adapter,
+            "session_id": "session-1",
+        }
+        run_async(self.plugin._handle_discord_lifecycle("agent:start", context))
+        self.assertEqual(adapter.calls, [("thread-1", "", "⏳")])
+
+    def test_start_ignores_non_discord_platform(self):
+        context = FakeAgentContext(platform="slack")
+        run_async(self.plugin._handle_discord_lifecycle("agent:start", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_start_ignores_missing_thread_id(self):
+        context = FakeAgentContext(thread_id="")
+        run_async(self.plugin._handle_discord_lifecycle("agent:start", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_start_ignores_noncallable_rename_thread(self):
+        adapter = FakeAdapter()
+        adapter.rename_thread = "not callable"
+        context = FakeAgentContext(adapter=adapter)
+        run_async(self.plugin._handle_discord_lifecycle("agent:start", context))
+        self.assertEqual(adapter.calls, [])
+
+    def test_step_updates_to_people_with_active_owned_child(self):
+        self._install_subagent_registry(
+            subagents=[{"owner_agent_session_id": "session-1"}]
+        )
+        context = FakeAgentContext(tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [("thread-1", "", "👥")])
+
+    def test_step_noops_without_delegate_task_tool(self):
+        self._install_subagent_registry(
+            subagents=[{"owner_agent_session_id": "session-1"}]
+        )
+        context = FakeAgentContext(tool_names=())
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_step_noops_without_owned_child(self):
+        self._install_subagent_registry(
+            subagents=[{"owner_agent_session_id": "someone-else"}]
+        )
+        context = FakeAgentContext(tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_step_noops_with_empty_child_session_id(self):
+        self._install_subagent_registry(subagents=[{"owner_agent_session_id": ""}])
+        context = FakeAgentContext(tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_step_noops_with_empty_context_session_id(self):
+        self._install_subagent_registry(
+            subagents=[{"owner_agent_session_id": "session-1"}]
+        )
+        context = FakeAgentContext(tool_names=("delegate_task",), session_id="")
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_step_noops_when_registry_raises(self):
+        self._install_subagent_registry(raises=True)
+        context = FakeAgentContext(tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_step_noops_when_registry_module_missing(self):
+        sys.modules.pop("tools.delegate_tool_registry", None)
+        context = FakeAgentContext(tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_step_ignores_non_discord_context(self):
+        self._install_subagent_registry(
+            subagents=[{"owner_agent_session_id": "session-1"}]
+        )
+        context = FakeAgentContext(platform="slack", tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:step", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_end_uses_cross_mark_on_failure(self):
+        self._install_subagent_registry()
+        context = FakeAgentContext(failed=True)
+        run_async(self.plugin._handle_discord_lifecycle("agent:end", context))
+        self.assertEqual(context.adapter.calls, [("thread-1", "", "❌")])
+
+    def test_end_prefers_failure_over_active_child(self):
+        self._install_subagent_registry(
+            subagents=[{"owner_agent_session_id": "session-1"}]
+        )
+        context = FakeAgentContext(failed=True, tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:end", context))
+        self.assertEqual(context.adapter.calls, [("thread-1", "", "❌")])
+
+    def test_end_uses_people_with_active_owned_child(self):
+        self._install_subagent_registry(
+            subagents=[{"owner_agent_session_id": "session-1"}]
+        )
+        context = FakeAgentContext(failed=False, tool_names=("delegate_task",))
+        run_async(self.plugin._handle_discord_lifecycle("agent:end", context))
+        self.assertEqual(context.adapter.calls, [("thread-1", "", "👥")])
+
+    def test_end_uses_check_mark_without_active_child(self):
+        self._install_subagent_registry()
+        context = FakeAgentContext(failed=False)
+        run_async(self.plugin._handle_discord_lifecycle("agent:end", context))
+        self.assertEqual(context.adapter.calls, [("thread-1", "", "✅")])
+
+    def test_end_ignores_non_discord_context(self):
+        context = FakeAgentContext(platform="slack", failed=True)
+        run_async(self.plugin._handle_discord_lifecycle("agent:end", context))
+        self.assertEqual(context.adapter.calls, [])
+
+    def test_rename_failure_is_swallowed(self):
+        async def raising_rename_thread(*_args, **_kwargs):
+            raise RuntimeError("discord API error")
+
+        adapter = FakeAdapter(rename_thread=raising_rename_thread)
+        context = FakeAgentContext(adapter=adapter)
+        run_async(self.plugin._handle_discord_lifecycle("agent:start", context))  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

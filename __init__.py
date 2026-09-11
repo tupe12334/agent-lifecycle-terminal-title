@@ -12,6 +12,9 @@ _ORIGINAL_SETTER_ATTR = "_agent_lifecycle_terminal_title_original_setter"
 _ORIGINAL_CLI_COMMAND_ATTR = "_agent_lifecycle_terminal_title_original_process_command"
 _ORIGINAL_CHAT_ATTR = "_agent_lifecycle_terminal_title_original_chat"
 _ORIGINAL_CLI_RUN_ATTR = "_agent_lifecycle_terminal_title_original_run"
+_ORIGINAL_REGISTER_BUILTIN_HOOKS_ATTR = (
+    "_agent_lifecycle_terminal_title_original_register_builtin_hooks"
+)
 
 _WORKING = "⌛️"
 _GOAL_WORKING = "🎯"
@@ -19,6 +22,15 @@ _SUCCESS = "✅"
 _FAILURE = "❗️"
 _UNACHIEVABLE = "🚫"
 _DEFAULT_TITLE = "Hermes"
+
+# Discord thread lifecycle emoji (see `register_discord_lifecycle_hooks` below).
+DISCORD_PLATFORM = "discord"
+DELEGATE_TASK_TOOL_NAME = "delegate_task"
+DISCORD_LIFECYCLE_EVENTS = ("agent:start", "agent:step", "agent:end")
+_DISCORD_EMOJI_START = "⏳"
+_DISCORD_EMOJI_DELEGATING = "👥"
+_DISCORD_EMOJI_DONE = "✅"
+_DISCORD_EMOJI_FAILED = "❌"
 
 _title_lock = threading.RLock()
 _base_title = _DEFAULT_TITLE
@@ -266,6 +278,116 @@ def _install_cli_close_title_writer() -> None:
     HermesCLI.run = wrapped
 
 
+def _read_field(obj: Any, name: str) -> Any:
+    """Read ``name`` off a dict-like or attribute-like record."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _has_active_owned_child(session_id: Any) -> bool:
+    """Whether a gateway session still owns a live delegated child."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return False
+    try:
+        from tools.delegate_tool_registry import list_active_subagents
+
+        return any(
+            str(_read_field(child, "owner_agent_session_id") or "") == session_id
+            for child in (list_active_subagents() or ())
+        )
+    except Exception:
+        return False
+
+
+async def _handle_discord_lifecycle(event_type: str, context: Any) -> None:
+    """Update only a Discord thread's lifecycle emoji; cosmetic failures are ignored."""
+    try:
+        if _read_field(context, "platform") != DISCORD_PLATFORM:
+            return
+        thread_id = str(_read_field(context, "thread_id") or "").strip()
+        adapter = _read_field(context, "adapter")
+        rename_thread = getattr(adapter, "rename_thread", None)
+        if not thread_id or not callable(rename_thread):
+            return
+
+        if event_type == "agent:start":
+            emoji = _DISCORD_EMOJI_START
+        elif event_type == "agent:step":
+            tool_names = _read_field(context, "tool_names") or ()
+            emoji = (
+                _DISCORD_EMOJI_DELEGATING
+                if DELEGATE_TASK_TOOL_NAME in tool_names
+                and _has_active_owned_child(_read_field(context, "session_id"))
+                else None
+            )
+        elif _read_field(context, "failed"):
+            emoji = _DISCORD_EMOJI_FAILED
+        else:
+            emoji = (
+                _DISCORD_EMOJI_DELEGATING
+                if _has_active_owned_child(_read_field(context, "session_id"))
+                else _DISCORD_EMOJI_DONE
+            )
+        if emoji:
+            await rename_thread(thread_id, "", lifecycle_emoji=emoji)
+    except Exception:
+        # Thread decoration is cosmetic and must never interrupt a gateway turn.
+        return
+
+
+_DISCORD_LIFECYCLE_HANDLERS = {
+    event: _handle_discord_lifecycle for event in DISCORD_LIFECYCLE_EVENTS
+}
+
+
+def _attach_discord_lifecycle_handlers(registry: Any) -> None:
+    """Register the Discord lifecycle handlers on a ``HookRegistry`` instance.
+
+    Appends into ``registry._handlers[event]`` alongside whatever the builtin
+    registration and any other plugin already installed, skipping an event
+    whose handler is already present so repeated calls stay idempotent.
+    """
+    handlers_by_event = getattr(registry, "_handlers", None)
+    if handlers_by_event is None:
+        return
+    for event, handler in _DISCORD_LIFECYCLE_HANDLERS.items():
+        try:
+            bucket = handlers_by_event.setdefault(event, [])
+        except Exception:
+            continue
+        if handler not in bucket:
+            bucket.append(handler)
+
+
+def _install_discord_lifecycle_hooks() -> None:
+    """Wrap ``gateway.hooks.HookRegistry._register_builtin_hooks`` once.
+
+    Hermes has no public gateway-lifecycle hook or adapter handle for
+    out-of-tree plugins, so this wraps the internal builtin-hook
+    registration boundary instead of touching gateway/core source. It
+    preserves the original method and calls it unchanged before attaching
+    the Discord thread lifecycle handlers, so existing builtin hooks and any
+    other plugin's callbacks are unaffected. No-ops harmlessly if the
+    gateway package isn't importable.
+    """
+    try:
+        from gateway.hooks import HookRegistry
+    except Exception:
+        return
+    if getattr(HookRegistry, _ORIGINAL_REGISTER_BUILTIN_HOOKS_ATTR, None) is not None:
+        return
+    original: Callable[[Any], None] = HookRegistry._register_builtin_hooks
+
+    def wrapped(self: Any) -> None:
+        original(self)
+        _attach_discord_lifecycle_handlers(self)
+
+    setattr(HookRegistry, _ORIGINAL_REGISTER_BUILTIN_HOOKS_ATTR, original)
+    HookRegistry._register_builtin_hooks = wrapped
+
+
 def register(ctx: Any) -> None:
     """Install idempotent title and foreground-CLI lifecycle integrations."""
     del ctx
@@ -273,3 +395,4 @@ def register(ctx: Any) -> None:
     _install_pending_cli_title_writer()
     _install_cli_lifecycle_writer()
     _install_cli_close_title_writer()
+    _install_discord_lifecycle_hooks()
