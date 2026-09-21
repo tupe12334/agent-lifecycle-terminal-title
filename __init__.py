@@ -37,6 +37,88 @@ _base_title = _DEFAULT_TITLE
 _lifecycle_marker = _SUCCESS
 _active_cli: Any = None
 _owned_children: set[str] = set()
+_owned_processes: set[str] = set()
+_seen_processes: set[str] = set()
+_process_owner: Any = None
+_background_failed = False
+_process_registry: Any = None
+_process_monitor: Any = None
+_process_monitor_stop = threading.Event()
+_process_refresh_lock = threading.Lock()
+
+
+def _refresh_background_processes(registry: Any = None) -> None:
+    # Hooks and the monitor may refresh concurrently. Serialize snapshots so an
+    # older running snapshot cannot overwrite a newer completion or handoff.
+    with _process_refresh_lock:
+        _refresh_background_snapshot(registry)
+
+
+def _refresh_background_snapshot(registry: Any = None) -> None:
+    """Observe registry state without consuming completion notifications."""
+    global _process_owner, _background_failed
+    registry = registry if registry is not None else _process_registry
+    with _title_lock:
+        owner = _cli_session_id()
+    if registry is None or not owner:
+        return
+    # Registry reconciliation can acquire its own locks and perform I/O.
+    # Never call it while holding the terminal-title lock.
+    try:
+        rows = registry.list_sessions()
+    except Exception:
+        return  # Cosmetic monitoring must not interrupt agent work.
+    with _title_lock:
+        if owner != _cli_session_id():
+            return
+        before = _render_title()
+        owned = {row['session_id']: row for row in rows if row.get('owner_task_id') == owner}
+        if _process_owner != owner:
+            _process_owner = owner
+            _owned_processes.clear()
+            _seen_processes.clear()
+            _seen_processes.update(owned)
+            _background_failed = False
+        for process_id, row in owned.items():
+            if (row.get('status') == 'exited'
+                    and (process_id in _owned_processes or process_id not in _seen_processes)
+                    and row.get('exit_code') != 0):
+                _background_failed = True
+        _owned_processes.clear()
+        _owned_processes.update(pid for pid, row in owned.items() if row.get('status') == 'running')
+        _seen_processes.update(owned)
+        if _render_title() != before:
+            _write_terminal_title()
+
+
+def _start_process_monitor() -> None:
+    """Only a foreground CLI starts a context-bound, process-local observer."""
+    global _process_registry, _process_monitor, _process_monitor_stop
+    if _process_monitor is not None and _process_monitor.is_alive():
+        _refresh_background_processes()
+        return
+    try:
+        from tools.process_registry import process_registry
+        from agent.memory_provider import spawn_context_thread
+    except ImportError:
+        return
+    _process_registry = process_registry
+    stop = threading.Event()
+    _process_monitor_stop = stop
+    _refresh_background_processes()
+
+    def monitor() -> None:
+        while not stop.wait(0.25):
+            _refresh_background_processes()
+
+    _process_monitor = spawn_context_thread(monitor, name='terminal-title-processes')
+    _process_monitor.start()
+
+
+def _on_post_tool_call(*, task_id=None, session_id=None, **_: Any) -> None:
+    owner = _cli_session_id()
+    if owner and owner in (task_id, session_id):
+        _refresh_background_processes()
 
 
 def _cli_session_id() -> Any:
@@ -53,6 +135,7 @@ def _on_subagent_start(*, parent_session_id=None, child_session_id=None, **_: An
 
 
 def _on_subagent_stop(*, parent_session_id=None, child_session_id=None, **_: Any) -> None:
+    _refresh_background_processes()  # Include any work handed off before the child stopped.
     with _title_lock:
         if not parent_session_id or parent_session_id != _cli_session_id():
             return
@@ -70,7 +153,14 @@ def _safe_terminal_title(value: Any) -> str:
 
 def _render_title() -> str:
     with _title_lock:
-        marker = "👥" if _owned_children and _lifecycle_marker != _FAILURE else _lifecycle_marker
+        marker = _lifecycle_marker
+        if marker != _FAILURE:
+            if _owned_children:
+                marker = "👥"
+            elif _owned_processes:
+                marker = _GOAL_WORKING if marker == _GOAL_WORKING else _WORKING
+            elif _background_failed and marker == _SUCCESS:
+                marker = _FAILURE
         return f"{marker} {_base_title}"
 
 
@@ -255,11 +345,13 @@ def _install_cli_lifecycle_writer() -> None:
     original: Callable[..., Any] = HermesCLI.chat
 
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
-        global _active_cli
+        global _active_cli, _background_failed
         with _title_lock:
             if _active_cli is not self:
                 _owned_children.clear()
             _active_cli = self
+            _background_failed = False
+        _start_process_monitor()
         goal_was_active = _goal_is_active(self)
         _restore_persisted_title(self)
         _set_lifecycle(_GOAL_WORKING if goal_was_active else _WORKING)
@@ -268,6 +360,7 @@ def _install_cli_lifecycle_writer() -> None:
         except BaseException:
             _set_lifecycle(_FAILURE)
             raise
+        _refresh_background_processes()
         # HermesCLI.chat returns None for setup/exception failures and converts
         # unrecovered turn failures into an ``Error: ...`` response.
         if response is None or (
@@ -302,9 +395,11 @@ def _install_cli_close_title_writer() -> None:
             session_id = getattr(self, "session_id", None)
             agent = getattr(self, "agent", None)
             session_id = getattr(agent, "session_id", None) or session_id
+            _process_monitor_stop.set()
             with _title_lock:
                 _active_cli = None
                 _owned_children.clear()
+                _owned_processes.clear()
                 if session_id:
                     _write_terminal_title(session_id)
 
@@ -486,6 +581,7 @@ def register(ctx: Any) -> None:
     if callable(register_hook):
         register_hook("subagent_start", _on_subagent_start)
         register_hook("subagent_stop", _on_subagent_stop)
+        register_hook("post_tool_call", _on_post_tool_call)
     # New Hermes versions publish an adapter-free lifecycle event and expose a
     # capability-gated emoji action. Retain the old private hook wrapper only
     # as a compatibility fallback for older Hermes installations.
