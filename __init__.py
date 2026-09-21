@@ -35,6 +35,30 @@ _DISCORD_EMOJI_FAILED = "❌"
 _title_lock = threading.RLock()
 _base_title = _DEFAULT_TITLE
 _lifecycle_marker = _SUCCESS
+_active_cli: Any = None
+_owned_children: set[str] = set()
+
+
+def _cli_session_id() -> Any:
+    agent = getattr(_active_cli, "agent", None)
+    return getattr(agent, "session_id", None) or getattr(_active_cli, "session_id", None)
+
+
+def _on_subagent_start(*, parent_session_id=None, child_session_id=None, **_: Any) -> None:
+    with _title_lock:
+        if not child_session_id or not parent_session_id or parent_session_id != _cli_session_id():
+            return
+        _owned_children.add(child_session_id)
+        _write_terminal_title()
+
+
+def _on_subagent_stop(*, parent_session_id=None, child_session_id=None, **_: Any) -> None:
+    with _title_lock:
+        if not parent_session_id or parent_session_id != _cli_session_id():
+            return
+        if child_session_id in _owned_children:
+            _owned_children.remove(child_session_id)
+            _write_terminal_title()
 
 
 def _safe_terminal_title(value: Any) -> str:
@@ -46,7 +70,8 @@ def _safe_terminal_title(value: Any) -> str:
 
 def _render_title() -> str:
     with _title_lock:
-        return f"{_lifecycle_marker} {_base_title}"
+        marker = "👥" if _owned_children and _lifecycle_marker != _FAILURE else _lifecycle_marker
+        return f"{marker} {_base_title}"
 
 
 def _run_tmux(*args: str) -> None:
@@ -113,14 +138,14 @@ def _set_base_title(title: Any) -> None:
     global _base_title
     with _title_lock:
         _base_title = _safe_terminal_title(title)
-    _write_terminal_title()
+        _write_terminal_title()
 
 
 def _set_lifecycle(marker: str) -> None:
     global _lifecycle_marker
     with _title_lock:
         _lifecycle_marker = marker
-    _write_terminal_title()
+        _write_terminal_title()
 
 
 def _goal_is_active(cli: Any) -> bool:
@@ -188,7 +213,7 @@ def _install_title_writer() -> None:
 
     def wrapped(self: Any, session_id: str, title: str, *, source: str) -> bool:
         changed = original(self, session_id, title, source=source)
-        if changed:
+        if changed and (_active_cli is None or session_id == _cli_session_id()):
             _set_base_title(title)
         return changed
 
@@ -230,6 +255,11 @@ def _install_cli_lifecycle_writer() -> None:
     original: Callable[..., Any] = HermesCLI.chat
 
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        global _active_cli
+        with _title_lock:
+            if _active_cli is not self:
+                _owned_children.clear()
+            _active_cli = self
         goal_was_active = _goal_is_active(self)
         _restore_persisted_title(self)
         _set_lifecycle(_GOAL_WORKING if goal_was_active else _WORKING)
@@ -265,14 +295,18 @@ def _install_cli_close_title_writer() -> None:
     original: Callable[..., Any] = HermesCLI.run
 
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        global _active_cli
         try:
             return original(self, *args, **kwargs)
         finally:
             session_id = getattr(self, "session_id", None)
             agent = getattr(self, "agent", None)
             session_id = getattr(agent, "session_id", None) or session_id
-            if session_id:
-                _write_terminal_title(session_id)
+            with _title_lock:
+                _active_cli = None
+                _owned_children.clear()
+                if session_id:
+                    _write_terminal_title(session_id)
 
     setattr(HermesCLI, _ORIGINAL_CLI_RUN_ATTR, original)
     HermesCLI.run = wrapped
@@ -448,6 +482,10 @@ def register(ctx: Any) -> None:
     _install_pending_cli_title_writer()
     _install_cli_lifecycle_writer()
     _install_cli_close_title_writer()
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        register_hook("subagent_start", _on_subagent_start)
+        register_hook("subagent_stop", _on_subagent_stop)
     # New Hermes versions publish an adapter-free lifecycle event and expose a
     # capability-gated emoji action. Retain the old private hook wrapper only
     # as a compatibility fallback for older Hermes installations.
