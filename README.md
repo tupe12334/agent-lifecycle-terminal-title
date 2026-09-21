@@ -4,17 +4,30 @@ A native [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin tha
 
 ## Lifecycle markers
 
+- `🙋` — waiting for your clarification answer or manual approval, or a Goal explicitly blocked on user input
 - `⌛️` — the local Hermes CLI is processing a user turn
 - `🎯` — the local Hermes CLI is working on an active Goal
 - `👥` — this CLI session has delegated children still running (including between turns)
 
 - `✅` — the most recent turn completed successfully
 - `❗️` — the most recent turn failed
-- `🚫` — an active Goal was judged unachievable, blocked, or in need of user input
+- `🚫` — an active Goal was judged unachievable or blocked for a reason other than user input
 
 Delegation uses Hermes's public `subagent_start` / `subagent_stop` hooks. Multiple children are tracked by session ID; unrelated sessions cannot change this terminal. The last child finishing restores the foreground lifecycle marker. Child title writes cannot replace the parent session title.
 
 The plugin mirrors manual `/title` changes, including a title queued before the first message, automatic Hermes titles, and titles on resumed sessions. It emits OSC 0 and OSC 2 only to a controlling TTY, so gateway, cron, and background work do not rename terminals. When the interactive CLI closes, it changes the title to the opaque session ID as a direct `hermes --resume` target.
+
+## Waiting for you
+
+`🙋` takes precedence over running children/background work while this CLI has a pending `clarify` question or manual approval prompt. The marker restores the actual work status after an answer, approval, denial, timeout, or cancellation. Overlapping requests are tracked separately, and automatic/smart approvals or unrelated sessions cannot mark this tab. Hooks are observers only: they never approve, deny, or change a tool result.
+
+A completed Goal whose blocked reason explicitly mentions user input also uses `🙋`; unrelated blocked/unachievable Goals retain `🚫`. Ordinary final-response prose is not heuristically classified as a request: use `clarify` for a decision that requires an answer. Opening an idle input prompt alone does not mean the agent needs you.
+
+Verify real discovery, hook dispatch, clarification callbacks, and the approval gate in a PTY without executing commands or calling an LLM:
+
+```sh
+python tests/integration_attention.py /path/to/hermes-agent
+```
 
 ## Background terminal commands
 

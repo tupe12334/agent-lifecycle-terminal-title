@@ -37,6 +37,42 @@ _base_title = _DEFAULT_TITLE
 _lifecycle_marker = _SUCCESS
 _active_cli: Any = None
 _owned_children: set[str] = set()
+_NEEDS_USER = "🙋"
+_pending_attention: set[tuple[str, str]] = set()
+
+
+def _set_attention(kind: str, request_id: Any, waiting: bool, *owners: Any) -> None:
+    with _title_lock:
+        owner = _cli_session_id()
+        if not owner or owner not in owners:
+            return
+        before = _render_title()
+        key = (kind, str(request_id or kind))
+        if waiting:
+            _pending_attention.add(key)
+        else:
+            _pending_attention.discard(key)
+        if before != _render_title():
+            _write_terminal_title()
+
+
+def _on_pre_tool_call(*, tool_name=None, task_id=None, session_id=None, tool_call_id=None, **_: Any) -> None:
+    if tool_name == "clarify":
+        _set_attention("clarify", tool_call_id, True, task_id, session_id)
+
+
+def _on_pre_approval_request(*, surface=None, session_id=None, session_key=None,
+                             tool_call_id=None, pattern_key=None, **_: Any) -> None:
+    if surface == "cli":
+        _set_attention("approval", tool_call_id or pattern_key, True, session_id, session_key)
+
+
+def _on_post_approval_response(*, surface=None, session_id=None, session_key=None,
+                              tool_call_id=None, pattern_key=None, **_: Any) -> None:
+    if surface == "cli":
+        _set_attention("approval", tool_call_id or pattern_key, False, session_id, session_key)
+
+
 _owned_processes: set[str] = set()
 _seen_processes: set[str] = set()
 _process_owner: Any = None
@@ -115,7 +151,9 @@ def _start_process_monitor() -> None:
     _process_monitor.start()
 
 
-def _on_post_tool_call(*, task_id=None, session_id=None, **_: Any) -> None:
+def _on_post_tool_call(*, task_id=None, session_id=None, tool_name=None, tool_call_id=None, **_: Any) -> None:
+    if tool_name == "clarify":
+        _set_attention("clarify", tool_call_id, False, task_id, session_id)
     owner = _cli_session_id()
     if owner and owner in (task_id, session_id):
         _refresh_background_processes()
@@ -154,6 +192,8 @@ def _safe_terminal_title(value: Any) -> str:
 def _render_title() -> str:
     with _title_lock:
         marker = _lifecycle_marker
+        if _pending_attention or marker == _NEEDS_USER:
+            return f"{_NEEDS_USER} {_base_title}"
         if marker != _FAILURE:
             if _owned_children:
                 marker = "👥"
@@ -279,6 +319,15 @@ def _goal_was_judged_unachievable(cli: Any) -> bool:
     )
 
 
+def _goal_needs_user_input(cli: Any) -> bool:
+    """Distinguish a goal waiting on its operator from an unrelated blocker."""
+    try:
+        reason = str(cli._get_goal_manager().state.last_reason or "").casefold()
+    except Exception:
+        return False
+    return any(phrase in reason for phrase in ("user input", "user approval", "user decision"))
+
+
 def _restore_persisted_title(cli: Any) -> None:
     """Use the resumed session title before setting a lifecycle state."""
     try:
@@ -350,6 +399,7 @@ def _install_cli_lifecycle_writer() -> None:
             if _active_cli is not self:
                 _owned_children.clear()
             _active_cli = self
+            _pending_attention.clear()
             _background_failed = False
         _start_process_monitor()
         goal_was_active = _goal_is_active(self)
@@ -360,6 +410,11 @@ def _install_cli_lifecycle_writer() -> None:
         except BaseException:
             _set_lifecycle(_FAILURE)
             raise
+        finally:
+            with _title_lock:
+                if _pending_attention:
+                    _pending_attention.clear()
+                    _write_terminal_title()
         _refresh_background_processes()
         # HermesCLI.chat returns None for setup/exception failures and converts
         # unrecovered turn failures into an ``Error: ...`` response.
@@ -368,7 +423,7 @@ def _install_cli_lifecycle_writer() -> None:
         ):
             _set_lifecycle(_FAILURE)
         elif goal_was_active and _goal_was_judged_unachievable(self):
-            _set_lifecycle(_UNACHIEVABLE)
+            _set_lifecycle(_NEEDS_USER if _goal_needs_user_input(self) else _UNACHIEVABLE)
         else:
             _set_lifecycle(_SUCCESS)
         return response
@@ -400,6 +455,7 @@ def _install_cli_close_title_writer() -> None:
                 _active_cli = None
                 _owned_children.clear()
                 _owned_processes.clear()
+                _pending_attention.clear()
                 if session_id:
                     _write_terminal_title(session_id)
 
@@ -582,6 +638,9 @@ def register(ctx: Any) -> None:
         register_hook("subagent_start", _on_subagent_start)
         register_hook("subagent_stop", _on_subagent_stop)
         register_hook("post_tool_call", _on_post_tool_call)
+        register_hook("pre_tool_call", _on_pre_tool_call)
+        register_hook("pre_approval_request", _on_pre_approval_request)
+        register_hook("post_approval_response", _on_post_approval_response)
     # New Hermes versions publish an adapter-free lifecycle event and expose a
     # capability-gated emoji action. Retain the old private hook wrapper only
     # as a compatibility fallback for older Hermes installations.
