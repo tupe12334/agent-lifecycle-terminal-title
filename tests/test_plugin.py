@@ -109,7 +109,7 @@ class LifecycleTitleTests(unittest.TestCase):
                 "blocked",
             )
             self.assertIn(sequence("🎯 Blocked goal"), captured.getvalue())
-            self.assertTrue(captured.getvalue().endswith(sequence("🚫 Blocked goal")))
+            self.assertTrue(captured.getvalue().endswith(sequence("🙋 Blocked goal")))
 
             captured.seek(0); captured.truncate(0)
             self.assertTrue(FakeCLI("Error: failed", "Broken").chat("hello").startswith("Error:"))
