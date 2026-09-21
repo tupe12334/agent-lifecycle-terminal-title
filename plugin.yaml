@@ -1,4 +1,7 @@
 name: agent-lifecycle-terminal-title
-version: 1.4.0
+version: 1.5.0
+provides_hooks:
+  - subagent_start
+  - subagent_stop
 description: Mirror Hermes lifecycle and session titles to terminal tabs and tmux windows, and act as the source of truth for Discord thread lifecycle emoji.
 author: Ofek
