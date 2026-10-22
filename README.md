@@ -85,6 +85,10 @@ Run the standard-library test suite:
 python3 -m unittest discover -s tests -v
 ```
 
+## See also
+
+- [moadim](https://moadim.io/) — loop engineering: build, schedule & run agent loops.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
